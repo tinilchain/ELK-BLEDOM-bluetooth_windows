@@ -1,0 +1,648 @@
+use std::error::Error;
+use std::fs;
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::f32::consts::PI;
+use serde::{Serialize, Deserialize};
+use device::{BleLedDevice, EFFECTS};
+use bluetooth::{BluetoothManager, BleDevice};
+use audio::AudioMonitor;
+use tokio;
+
+/*
+* 蓝牙 LED 控制器
+* 用于通过蓝牙连接控制 LED 灯带
+*/
+
+mod device;
+mod audio;
+mod bluetooth;
+mod config;
+
+use device::{BleLedDevice, EFFECTS, WEEK_DAYS};
+use audio::AudioMonitor;
+use bluetooth::{BluetoothManager, BleDevice};
+use config::Config;
+use std::thread;
+use std::io::{self, Read};
+use std::sync::mpsc;
+use std::f32::consts::PI;
+use serde::{Serialize, Deserialize};
+
+/*
+功能说明：
+1. 设备管理：
+   - 自动搜索并筛选 ELK-BLEDOM LED 设备
+   - 支持设备绑定和解绑
+   - 保存已绑定设备信息
+   - 自动连接已绑定设备
+
+2. 基本颜色状态：
+   - 默认白光模式：白色，亮度50
+   - 呼吸灯模式：亮度20-60，周期3秒
+   - 支持保存默认颜色模式
+
+3. 收音颜色状态：
+   - 实时监测麦克风输入
+   - 音量>5触发收音模式
+   - 1秒无音自动退出
+   - 亮度随音量变化
+
+4. 测试颜色状态：
+   - 支持所有预设效果测试
+   - 按键进入/退出测试模式
+
+5. 电源管理：
+   - 开启时自动power on
+   - 关闭时自动power off
+*/
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum ColorMode {
+    White,
+    RGB,
+    Breathing,
+    Rainbow,
+}
+
+impl Default for ColorMode {
+    fn default() -> Self {
+        ColorMode::White
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LightState {
+    Basic(ColorMode),
+    Audio,
+    Test,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DeviceConfig {
+    pub devices: Vec<BleDevice>,
+    pub default_color_mode: ColorMode,
+    pub active_device: Option<String>,
+}
+
+impl DeviceConfig {
+    fn load() -> Self {
+        if let Ok(content) = fs::read_to_string("config.json") {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    fn save(&self) -> io::Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write("config.json", content)
+    }
+
+    fn is_device_bound(&self, address: &str) -> bool {
+        self.devices.iter().any(|d| d.address == address)
+    }
+
+    fn add_device(&mut self, device: BleDevice) {
+        if !self.is_device_bound(&device.address) {
+            self.devices.push(device);
+        }
+    }
+
+    fn get_devices(&self) -> &[BleDevice] {
+        &self.devices
+    }
+}
+
+pub struct DeviceManager {
+    config: DeviceConfig,
+    devices: Vec<BleLedDevice>,
+    last_audio_time: Instant,
+    volume_receiver: mpsc::Receiver<f32>,
+    audio_monitor: AudioMonitor,
+    state: LightState,
+}
+
+impl DeviceManager {
+    fn new(audio_monitor: AudioMonitor, volume_receiver: mpsc::Receiver<f32>) -> Self {
+        Self {
+            config: DeviceConfig::load(),
+            devices: Vec::new(),
+            last_audio_time: Instant::now(),
+            volume_receiver,
+            audio_monitor,
+            state: LightState::Basic(ColorMode::White),
+        }
+    }
+
+    fn initialize_all_devices(&mut self) {
+        for device in &self.devices {
+            device.power_on();
+            match self.config.default_color_mode {
+                ColorMode::White => {
+                    device.set_color(255, 255, 255);
+                    device.set_brightness(50);
+                }
+                ColorMode::Breathing => {
+                    // 呼吸模式初始状态
+                    device.set_color(255, 255, 255);
+                    device.set_brightness(20);
+                }
+            }
+        }
+    }
+
+    async fn initialize_devices(config: &DeviceConfig) -> Vec<BleLedDevice> {
+        if config.devices.is_empty() {
+            println!("未找到已绑定的设备，开始搜索...");
+            Self::scan_and_bind_devices().await
+        } else {
+            println!("连接已绑定的设备...");
+            let mut devices = Vec::new();
+            for device_info in &config.devices {
+                if let Ok(device) = BleLedDevice::connect(&device_info.address).await {
+                    devices.push(device);
+                    println!("成功连接设备: {}", device_info.name);
+                }
+            }
+            devices
+        }
+    }
+
+    async fn scan_and_bind_devices() -> Vec<BleLedDevice> {
+        let bluetooth_manager = BluetoothManager::new().await;
+        let devices = bluetooth_manager.scan_devices().await.unwrap_or_default();
+        
+        println!("\n发现以下 LED 设备：");
+        let mut led_devices = Vec::new();
+        for device in devices.iter() {
+            if device.is_led_device() {
+                println!("{}. {} ({})", led_devices.len() + 1, device.name, device.address);
+                led_devices.push(device.clone());
+            }
+        }
+
+        if led_devices.is_empty() {
+            println!("未找到 LED 设备");
+            return Vec::new();
+        }
+
+        print!("请选择要绑定的设备编号（0取消）: ");
+        io::stdout().flush().unwrap();
+        
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice).unwrap();
+        
+        if let Ok(index) = choice.trim().parse::<usize>() {
+            if index > 0 && index <= led_devices.len() {
+                let device = &led_devices[index - 1];
+                if let Ok(ble_device) = BleLedDevice::connect(&device.address).await {
+                    return vec![ble_device];
+                }
+            }
+        }
+        
+        Vec::new()
+    }
+
+    pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
+        loop {
+            if self.state == LightState::Audio {
+                let volume = self.get_volume();
+                for device in &mut self.devices {
+                    device.set_brightness((volume * 255.0) as u8);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn handle_audio_input(&mut self, volume: f32) {
+        let normalized_volume = volume * 100.0;
+        
+        if normalized_volume > 5.0 {
+            self.state = LightState::Audio;
+            self.last_audio_time = Instant::now();
+            
+            // 将音量映射到亮度范围 (20-100)
+            let brightness = (normalized_volume * 0.8 + 20.0) as u8;
+            for device in &self.devices {
+                device.set_brightness(brightness.min(100));
+            }
+        } else if self.state == LightState::Audio && self.last_audio_time.elapsed() > Duration::from_secs(1) {
+            // 恢复到基本模式
+            self.state = LightState::Basic(self.config.default_color_mode.clone());
+            self.apply_basic_mode();
+        }
+    }
+
+    fn update_breathing_effect(&self) {
+        let elapsed = self.last_audio_time.elapsed();
+        let period = Duration::from_secs(3);
+        let phase = (elapsed.as_secs_f32() / period.as_secs_f32() * 2.0 * PI) % (2.0 * PI);
+        
+        // 使用正弦函数计算亮度 (20-60)
+        let brightness = ((((phase.sin() + 1.0) / 2.0) * 40.0 + 20.0) as u8).min(60);
+        
+        for device in &self.devices {
+            device.set_brightness(brightness);
+        }
+    }
+
+    fn apply_basic_mode(&mut self) {
+        match self.config.default_color_mode {
+            ColorMode::White => {
+                for device in &mut self.devices {
+                    device.set_color(255, 255, 255);
+                }
+            },
+            ColorMode::Breathing => {
+                for device in &mut self.devices {
+                    device.set_brightness(128);
+                    device.set_effect(EFFECTS.crossfade_red_green_blue);
+                }
+            },
+            ColorMode::RGB => {
+                for device in &mut self.devices {
+                    device.set_color(255, 0, 0);
+                }
+            },
+            ColorMode::Rainbow => {
+                for device in &mut self.devices {
+                    device.set_effect(EFFECTS.jump_red_green_blue_yellow_cyan_magenta_white);
+                }
+            }
+        }
+    }
+
+    fn setup_devices(&mut self) {
+        match self.config.default_color_mode {
+            ColorMode::White => {
+                // 设置白色灯光
+                for device in &mut self.devices {
+                    device.set_color(255, 255, 255);
+                }
+            },
+            ColorMode::Breathing => {
+                // 设置呼吸模式
+                for device in &mut self.devices {
+                    device.set_brightness(128);
+                    device.set_effect(EFFECTS.crossfade_red_green_blue);
+                }
+            },
+            ColorMode::RGB => {
+                // 设置 RGB 模式
+                for device in &mut self.devices {
+                    device.set_color(255, 0, 0);
+                }
+            },
+            ColorMode::Rainbow => {
+                // 设置彩虹模式
+                for device in &mut self.devices {
+                    device.set_effect(EFFECTS.jump_red_green_blue_yellow_cyan_magenta_white);
+                }
+            }
+        }
+    }
+
+    async fn handle_input(&mut self, key: u8) -> bool {
+        match key as char {
+            ' ' => self.toggle_basic_mode(),
+            't' => self.enter_test_mode(),
+            'd' => self.show_device_menu().await,
+            'q' => {
+                self.cleanup();
+                return false;
+            }
+            '1' => {
+                match self.config.default_color_mode {
+                    ColorMode::White => {
+                        for device in &mut self.devices {
+                            device.set_color(255, 255, 255);
+                        }
+                    },
+                    ColorMode::Breathing => {
+                        for device in &mut self.devices {
+                            device.set_brightness(128);
+                            device.set_effect(EFFECTS.crossfade_red_green_blue);
+                        }
+                    },
+                    ColorMode::RGB => {
+                        for device in &mut self.devices {
+                            device.set_color(255, 0, 0);
+                        }
+                    },
+                    ColorMode::Rainbow => {
+                        for device in &mut self.devices {
+                            device.set_effect(EFFECTS.jump_red_green_blue_yellow_cyan_magenta_white);
+                        }
+                    },
+                }
+            }
+            x if self.state == LightState::Test => {
+                self.handle_test_input(x as char);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn toggle_basic_mode(&mut self) {
+        match self.config.default_color_mode {
+            ColorMode::White => {
+                // ... 处理白色模式
+            },
+            ColorMode::Breathing => {
+                // ... 处理呼吸模式
+            },
+            ColorMode::RGB => {
+                // ... 处理 RGB 模式
+            },
+            ColorMode::Rainbow => {
+                // ... 处理彩虹模式
+            }
+        }
+    }
+
+    fn enter_test_mode(&mut self) {
+        self.state = LightState::Test;
+        println!("\n测试模式：");
+        println!("1-7: 不同效果");
+        println!("q: 退出测试模式");
+    }
+
+    fn handle_test_input(&mut self, key: char) {
+        let effect = match key {
+            '1' => Some(EFFECTS.jump_red_green_blue),
+            '2' => Some(EFFECTS.crossfade_red_green_blue),
+            '3' => Some(EFFECTS.blink_red_green_blue_yellow_cyan_magenta_white),
+            '4' => Some(EFFECTS.crossfade_red),
+            '5' => Some(EFFECTS.crossfade_green),
+            '6' => Some(EFFECTS.crossfade_blue),
+            '7' => Some(EFFECTS.crossfade_white),
+            'q' => {
+                self.state = LightState::Basic(self.config.default_color_mode.clone());
+                self.apply_basic_mode();
+                return;
+            }
+            _ => None,
+        };
+
+        if let Some(effect_value) = effect {
+            for device in &self.devices {
+                device.set_effect(effect_value);
+                device.set_effect_speed(50);
+            }
+        }
+    }
+
+    async fn show_device_menu(&mut self) {
+        let bluetooth_manager = BluetoothManager::new().await;
+        
+        loop {
+            println!("\n设备管理：");
+            println!("1. 扫描新设备");
+            println!("2. 查看已绑定设备");
+            println!("3. 解绑所有设备");
+            println!("0. 返回");
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+
+            match input.trim() {
+                "1" => {
+                    let new_devices = Self::scan_and_bind_devices().await;
+                    self.devices.extend(new_devices);
+                    self.initialize_all_devices();
+                }
+                "2" => {
+                    self.list_devices();
+                }
+                "3" => {
+                    self.clear_devices();
+                }
+                "0" => break,
+                _ => println!("无效的选择"),
+            }
+        }
+    }
+
+    fn cleanup(&mut self) {
+        for device in &self.devices {
+            device.power_off();
+        }
+    }
+
+    fn print_help(&self) {
+        println!("\n控制说明：");
+        println!("空格: 切换基本模式（白光/呼吸）");
+        println!("t: 进入测试模式");
+        println!("d: 设备管理");
+        println!("q: 退出程序");
+    }
+
+    fn handle_color_mode(&mut self, mode: &ColorMode) {
+        match mode {
+            ColorMode::White => {
+                for device in &mut self.devices {
+                    device.set_color(255, 255, 255);
+                }
+            }
+            ColorMode::RGB => {
+                for device in &mut self.devices {
+                    device.set_color(255, 0, 0);
+                }
+            }
+            ColorMode::Breathing => {
+                for device in &mut self.devices {
+                    device.set_effect(EFFECTS.jump_red_green_blue);
+                }
+            }
+            ColorMode::Rainbow => {
+                for device in &mut self.devices {
+                    device.set_effect(EFFECTS.jump_red_green_blue_yellow_cyan_magenta_white);
+                }
+            }
+        }
+    }
+
+    fn handle_next_mode(&mut self) {
+        if let LightState::Basic(mode) = &self.state {
+            self.state = LightState::Basic(match *mode {
+                ColorMode::White => ColorMode::RGB,
+                ColorMode::RGB => ColorMode::Breathing,
+                ColorMode::Breathing => ColorMode::Rainbow,
+                ColorMode::Rainbow => ColorMode::White,
+            });
+        }
+    }
+
+    async fn scan_devices(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.config.devices.is_empty() {
+            println!("没有绑定的设备");
+            return Ok(());
+        }
+
+        println!("扫描已绑定的设备...");
+        for device_info in &self.config.devices {
+            match BleLedDevice::connect(&device_info.address).await {
+                Ok(device) => {
+                    println!("成功连接到设备: {}", device_info.name);
+                    self.devices.push(device);
+                }
+                Err(e) => {
+                    eprintln!("连接设备失败: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn list_devices(&self) {
+        println!("\n已绑定的设备:");
+        for (i, device) in self.config.devices.iter().enumerate() {
+            println!("{}. {} ({})", i + 1, device.name, device.address);
+        }
+    }
+
+    fn clear_devices(&mut self) {
+        self.config.devices.clear();
+        if let Err(e) = self.config.save() {
+            eprintln!("保存配置失败: {}", e);
+        }
+    }
+
+    fn start_audio_monitoring(&mut self) -> Result<(), Box<dyn Error>> {
+        self.audio_monitor.start()
+    }
+
+    fn get_volume(&self) -> f32 {
+        self.audio_monitor.get_volume()
+    }
+
+    fn handle_pattern_transition(&mut self) {
+        match self.config.default_color_mode {
+            ColorMode::White => {
+                for device in &mut self.devices {
+                    device.set_color(255, 255, 255);
+                }
+            },
+            ColorMode::Breathing => {
+                for device in &mut self.devices {
+                    device.set_brightness(128);
+                    device.set_effect(EFFECTS.jump_red_green_blue);
+                }
+            },
+            ColorMode::RGB => {
+                for device in &mut self.devices {
+                    device.set_color(255, 0, 0);
+                }
+            },
+            ColorMode::Rainbow => {
+                for device in &mut self.devices {
+                    device.set_effect(EFFECTS.jump_red_green_blue_yellow_cyan_magenta_white);
+                }
+            }
+        }
+    }
+
+    fn handle_initial_state(&mut self) {
+        match self.config.default_color_mode {
+            ColorMode::White => {
+                for device in &mut self.devices {
+                    device.set_color(255, 255, 255);
+                }
+            },
+            ColorMode::Breathing => {
+                for device in &mut self.devices {
+                    device.set_brightness(128);
+                    device.set_effect(EFFECTS.jump_red_green_blue);
+                }
+            },
+            ColorMode::RGB => {
+                for device in &mut self.devices {
+                    device.set_color(255, 0, 0);
+                }
+            },
+            ColorMode::Rainbow => {
+                for device in &mut self.devices {
+                    device.set_effect(EFFECTS.jump_red_green_blue_yellow_cyan_magenta_white);
+                }
+            }
+        }
+    }
+
+    fn update_mode_status(&mut self) {
+        match self.config.default_color_mode {
+            ColorMode::White => {
+                // ... 处理白色模式
+            },
+            ColorMode::Breathing => {
+                // ... 处理呼吸模式
+            },
+            ColorMode::RGB => {
+                // ... 处理 RGB 模式
+            },
+            ColorMode::Rainbow => {
+                // ... 处理彩虹模式
+            }
+        }
+    }
+
+    fn default_color_mode_changed(&mut self) {
+        match self.config.default_color_mode {
+            ColorMode::White => {
+                // 处理白色模式
+            },
+            ColorMode::Breathing => {
+                // 处理呼吸模式
+            },
+            ColorMode::RGB => {
+                // 处理 RGB 模式
+            },
+            ColorMode::Rainbow => {
+                // 处理彩虹模式
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let (audio_monitor, volume_receiver) = AudioMonitor::new();
+    let mut device_manager = DeviceManager::new(audio_monitor, volume_receiver);
+    
+    if let Err(e) = device_manager.start_audio_monitoring() {
+        eprintln!("启动音频监控失败: {}", e);
+        return Ok(());
+    }
+
+    let bluetooth_manager = BluetoothManager::new().await;
+    println!("扫描蓝牙设备...");
+
+    let devices = bluetooth_manager.scan_devices().await?;
+    if devices.is_empty() {
+        println!("未找到设备");
+        return Ok(());
+    }
+
+    for device in devices {
+        if !device_manager.config.is_device_bound(&device.address) {
+            println!("发现新设备: {} ({})", device.name, device.address);
+            device_manager.config.add_device(device);
+            device_manager.config.save()?;
+        }
+    }
+
+    if let Err(e) = device_manager.scan_devices().await {
+        eprintln!("扫描设备失败: {}", e);
+        return Ok(());
+    }
+
+    println!("运行中... 按 Ctrl+C 停止");
+    device_manager.run().await?;
+
+    Ok(())
+}

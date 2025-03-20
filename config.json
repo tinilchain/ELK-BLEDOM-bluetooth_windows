@@ -1,0 +1,10 @@
+{
+  "devices": [
+    {
+      "name": "ELK-BLEDOM   ",
+      "address": "BE:58:30:01:67:25"
+    }
+  ],
+  "default_color_mode": "White",
+  "active_device": null
+}

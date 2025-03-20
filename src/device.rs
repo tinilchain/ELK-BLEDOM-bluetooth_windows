@@ -1,6 +1,6 @@
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Manager, Peripheral};
-use chrono;
+use chrono::{self, Timelike, Datelike};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -62,26 +62,26 @@ pub struct Effects {
 pub const EFFECTS: Effects = Effects {
     jump_red_green_blue: 0x87,
     jump_red_green_blue_yellow_cyan_magenta_white: 0x88,
-    crossfade_red: 0x8b,
-    crossfade_green: 0x8c,
-    crossfade_blue: 0x8d,
-    crossfade_yellow: 0x8e,
-    crossfade_cyan: 0x8f,
+    crossfade_red: 0x8B,
+    crossfade_green: 0x8C,
+    crossfade_blue: 0x8D,
+    crossfade_yellow: 0x8E,
+    crossfade_cyan: 0x8F,
     crossfade_magenta: 0x90,
     crossfade_white: 0x91,
     crossfade_red_green: 0x92,
     crossfade_red_blue: 0x93,
     crossfade_green_blue: 0x94,
     crossfade_red_green_blue: 0x89,
-    crossfade_red_green_blue_yellow_cyan_magenta_white: 0x8a,
-    blink_red: 0x96,
-    blink_green: 0x97,
-    blink_blue: 0x98,
-    blink_yellow: 0x99,
-    blink_cyan: 0x9a,
-    blink_magenta: 0x9b,
-    blink_white: 0x9c,
-    blink_red_green_blue_yellow_cyan_magenta_white: 0x95,
+    crossfade_red_green_blue_yellow_cyan_magenta_white: 0x8A,
+    blink_red: 0x95,
+    blink_green: 0x96,
+    blink_blue: 0x97,
+    blink_yellow: 0x98,
+    blink_cyan: 0x99,
+    blink_magenta: 0x9A,
+    blink_white: 0x9B,
+    blink_red_green_blue_yellow_cyan_magenta_white: 0x9C,
 };
 
 pub struct BleLedDevice {
@@ -90,314 +90,111 @@ pub struct BleLedDevice {
 }
 
 impl BleLedDevice {
-    pub fn new() -> BleLedDevice {
-        block_on(async {
-            let manager = Manager::new().await.unwrap();
-            let adapters = manager.adapters().await.unwrap();
-            let central = adapters.into_iter().nth(0).unwrap();
-            let mut characteristics = Vec::new();
-            let mut found_peripheral = None;
+    pub async fn connect(address: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let manager = Manager::new().await?;
+        let adapters = manager.adapters().await?;
+        let central = adapters.into_iter().next().ok_or("No Bluetooth adapter found")?;
 
-            central.start_scan(ScanFilter::default()).await.unwrap();
-            thread::sleep(Duration::from_secs(2));
+        central.start_scan(Default::default()).await?;
+        std::thread::sleep(Duration::from_secs(2));
 
-            let peripherals = central.peripherals().await.unwrap();
-            
-            println!("正在扫描蓝牙设备...");
-            for p in peripherals {
-                if let Ok(Some(props)) = p.properties().await {
-                    if let Some(local_name) = props.local_name {
-                        println!("发现设备: {}", local_name);
-                        if local_name.contains("ELK-BLEDOM") {
-                            println!("找到 ELK-BLEDOM 设备，正在连接...");
-                            p.connect().await.unwrap();
-                            thread::sleep(Duration::from_millis(500));
-                            
-                            println!("正在发现服务...");
-                            p.discover_services().await.unwrap();
-                            
-                            let chars = p.characteristics();
-                            println!("获取到特征值数量: {}", chars.len());
-                            for c in chars.iter() {
-                                println!("特征值 UUID: {}", c.uuid);
-                                println!("特征值属性: {:?}", c.properties);
-                                
-                                if c.properties.contains(btleplug::api::CharPropFlags::WRITE_WITHOUT_RESPONSE) {
-                                    characteristics.push(c.clone());
-                                }
-                            }
-                            
-                            if !characteristics.is_empty() {
-                                println!("找到可写入的特征值数量: {}", characteristics.len());
-                                found_peripheral = Some(p);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+        let peripherals = central.peripherals().await?;
+        let device = peripherals.into_iter()
+            .find(|p| p.address().to_string() == address)
+            .ok_or("Device not found")?;
 
-            if let Some(peripheral) = found_peripheral {
-                println!("设备连接成功！");
-                let device = BleLedDevice {
-                    peripheral,
-                    characteristics,
-                };
+        device.connect().await?;
+        device.discover_services().await?;
 
-                // 初始化设备
-                let char = device.get_characteristic();
-                
-                // 同步时间
-                let system_time = chrono::offset::Local::now();
-                device.peripheral
-                    .write(
-                        char,
-                        &[
-                            0x7e,
-                            0x00,
-                            0x83,
-                            chrono::Timelike::hour(&system_time) as u8,
-                            chrono::Timelike::minute(&system_time) as u8,
-                            chrono::Timelike::second(&system_time) as u8,
-                            chrono::Datelike::weekday(&system_time).number_from_monday() as u8,
-                            0x00,
-                            0xef,
-                        ],
-                        WriteType::WithoutResponse,
-                    )
-                    .await
-                    .unwrap();
-
-                // 开机
-                device.peripheral
-                    .write(
-                        char,
-                        &[0x7e, 0x00, 0x04, 0xf0, 0x00, 0x01, 0xff, 0x00, 0xef],
-                        WriteType::WithoutResponse,
-                    )
-                    .await
-                    .unwrap();
-
-                println!("设置 LED 为红色闪烁模式...");
-                
-                // 设置亮度
-                device.peripheral
-                    .write(
-                        char,
-                        &[0x7e, 0x00, 0x01, 100, 0x00, 0x00, 0x00, 0x00, 0xef],
-                        WriteType::WithoutResponse,
-                    )
-                    .await
-                    .unwrap();
-
-                // 设置颜色
-                device.peripheral
-                    .write(
-                        char,
-                        &[0x7e, 0x00, 0x05, 0x03, 255, 0, 0, 0x00, 0xef],
-                        WriteType::WithoutResponse,
-                    )
-                    .await
-                    .unwrap();
-
-                thread::sleep(Duration::from_millis(100));
-
-                // 设置闪烁效果
-                device.peripheral
-                    .write(
-                        char,
-                        &[0x7e, 0x00, 0x03, EFFECTS.blink_red, 0x03, 0x00, 0x00, 0x00, 0xef],
-                        WriteType::WithoutResponse,
-                    )
-                    .await
-                    .unwrap();
-
-                // 设置闪烁速度
-                device.peripheral
-                    .write(
-                        char,
-                        &[0x7e, 0x00, 0x02, 50, 0x00, 0x00, 0x00, 0x00, 0xef],
-                        WriteType::WithoutResponse,
-                    )
-                    .await
-                    .unwrap();
-
-                device
-            } else {
-                panic!("未找到匹配的设备！请确保 ELK-BLEDOM LED 控制器已开启并在范围内");
-            }
-        })
+        let characteristics = device.characteristics();
+        let characteristics_vec = characteristics.into_iter().collect();
+        Ok(Self { peripheral: device, characteristics: characteristics_vec })
     }
 
     fn get_characteristic(&self) -> &btleplug::api::Characteristic {
-        self.characteristics.get(0).unwrap()
+        &self.characteristics[0]
     }
 
     pub async fn write_command(&self, command: &[u8]) {
-        self.peripheral
+        if let Err(e) = self.peripheral
             .write(
                 self.get_characteristic(),
                 command,
                 WriteType::WithoutResponse,
             )
             .await
-            .unwrap();
+        {
+            eprintln!("写入命令失败: {}", e);
+        }
     }
 
     pub fn set_color(&self, red_value: u8, green_value: u8, blue_value: u8) {
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x05,
-            0x03,
-            red_value,
-            green_value,
-            blue_value,
-            0x00,
-            0xef,
-        ]));
+        let command = [0x7E, 0x00, 0x05, 0x03, red_value, green_value, blue_value, 0xEF];
+        block_on(self.write_command(&command));
     }
 
     pub fn set_brightness(&self, value: u8) {
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x01,
-            value.min(0x64),
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0xef,
-        ]));
+        let normalized_value = value.min(100);
+        let command = [0x7E, 0x00, 0x01, normalized_value, 0x00, 0x00, 0x00, 0xEF];
+        block_on(self.write_command(&command));
     }
 
     pub fn set_effect(&self, value: u8) {
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x03,
-            value,
-            0x03,
-            0x00,
-            0x00,
-            0x00,
-            0xef,
-        ]));
+        let command = [0x7E, 0x00, 0x03, value, 0x03, 0x00, 0x00, 0xEF];
+        block_on(self.write_command(&command));
     }
 
     pub fn set_effect_speed(&self, value: u8) {
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x02,
-            value.min(0x64),
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0xef,
-        ]));
+        let normalized_value = value.min(100);
+        let command = [0x7E, 0x00, 0x02, normalized_value, 0x00, 0x00, 0x00, 0xEF];
+        block_on(self.write_command(&command));
     }
 
     pub fn power_on(&self) {
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x04,
-            0xf0,
-            0x00,
-            0x01,
-            0xff,
-            0x00,
-            0xef,
-        ]));
+        let command = [0x7E, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0xEF];
+        block_on(self.write_command(&command));
     }
 
     pub fn power_off(&self) {
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x04,
-            0x00,
-            0x00,
-            0x00,
-            0xff,
-            0x00,
-            0xef,
-        ]));
+        let command = [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0xEF];
+        block_on(self.write_command(&command));
     }
 
     pub fn sync_time(&self) {
-        let system_time = chrono::offset::Local::now();
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x83,
-            chrono::Timelike::hour(&system_time) as u8,
-            chrono::Timelike::minute(&system_time) as u8,
-            chrono::Timelike::second(&system_time) as u8,
-            chrono::Datelike::weekday(&system_time).number_from_monday() as u8,
-            0x00,
-            0xef,
-        ]));
+        let now = chrono::Local::now();
+        self.set_custom_time(
+            now.hour() as u8,
+            now.minute() as u8,
+            now.second() as u8,
+            now.weekday().num_days_from_monday() as u8 + 1,
+        );
     }
 
     pub fn set_custom_time(&self, hour: u8, minute: u8, second: u8, day_of_week: u8) {
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x83,
-            hour.min(23),
-            minute.min(59),
-            second.min(59),
-            day_of_week.min(7).max(1),
-            0x00,
-            0xef,
-        ]));
+        let command = [0x7E, 0x00, 0x83, hour, minute, second, day_of_week, 0xEF];
+        block_on(self.write_command(&command));
     }
 
     pub fn set_schedule_on(&self, days: u8, hours: u8, minutes: u8, enabled: bool) {
-        let value = if enabled { days + 0x80 } else { days };
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x82,
-            hours.min(23),
-            minutes.min(59),
-            0x00,
-            0x00,
-            value,
-            0xef,
-        ]));
+        let command = [
+            0x7E, 0x00, 0x82, days, hours, minutes,
+            if enabled { 0x01 } else { 0x00 },
+            0xEF
+        ];
+        block_on(self.write_command(&command));
     }
 
     pub fn set_schedule_off(&self, days: u8, hours: u8, minutes: u8, enabled: bool) {
-        let value = if enabled { days + 0x80 } else { days };
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            0x82,
-            hours.min(23),
-            minutes.min(59),
-            0x00,
-            0x01,
-            value,
-            0xef,
-        ]));
+        let command = [
+            0x7E, 0x00, 0x82, days, hours, minutes,
+            if enabled { 0x00 } else { 0x01 },
+            0xEF
+        ];
+        block_on(self.write_command(&command));
     }
 
     pub fn generic_command(&self, id: u8, sub_id: u8, arg1: u8, arg2: u8, arg3: u8) {
-        block_on(self.write_command(&[
-            0x7e,
-            0x00,
-            id,
-            sub_id,
-            arg1,
-            arg2,
-            arg3,
-            0x00,
-            0xef,
-        ]));
+        let command = [0x7E, id, sub_id, arg1, arg2, arg3, 0x00, 0xEF];
+        block_on(self.write_command(&command));
     }
 }
