@@ -7,5 +7,8 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-btleplug = "0.5.4"
-chrono = "0.4.19"
+btleplug = "0.11"
+chrono = "0.4.31"
+uuid = "1.6"
+futures = "0.3"
+tokio = { version = "1.36", features = ["full"] }

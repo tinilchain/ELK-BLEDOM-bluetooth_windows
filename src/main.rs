@@ -1,39 +1,42 @@
 mod device;
-use device::*;
+use device::{BleLedDevice, EFFECTS};
+use std::io::{self, Read};
 
-pub fn main() {
-    /*
-    //////////Examples//////////
-    //Initialize the device
+fn main() {
+    println!("正在连接 LED 控制器...");
     let device = BleLedDevice::new();
-
-    //Power off the leds
-    device.power_off();
-
-    //Power on the leds
-    device.power_on();
-
-    //Set a static color
-    device.set_color(255, 0, 0); // Red
-
-    //Set led brightness (0-100)
-    device.set_brightness(100);
-
-    //Set an effect
-    device.set_effect(EFFECTS.crossfade_red_green_blue_yellow_cyan_magenta_white);
-
-    //Set effect speed (0-100)
-    device.set_effect_speed(0);
-
-    //Set schedule for powering the leds on at a given time
-    device.set_schedule_on(WEEK_DAYS.monday+WEEK_DAYS.thursday, 08, 30, true);
-
-    //Set schedule for powering the leds off at a given time
-    device.set_schedule_off(WEEK_DAYS.week_days, 23, 45, true);
-
-    //Set the time inside the BLE device, this probably isn't useful at all, but there's the option.
-    //The time of the device always syncs automatically with the system time when intializing a device anyway.
-    device.set_custom_time(17, 00, 00, 3); // Hour: 17:00:00 <--> Day: 3|Wednesday 
-    ////////////////////////////
-    */
+    
+    println!("\n控制说明：");
+    println!("- 按空格键：关闭 LED");
+    println!("- 按回车键：开启红色闪烁效果");
+    println!("- 按 q 键退出程序");
+    
+    let mut stdin = io::stdin();
+    let mut buffer = [0; 1];
+    
+    loop {
+        if let Ok(_) = stdin.read_exact(&mut buffer) {
+            match buffer[0] {
+                b' ' => {  // 空格键
+                    println!("关闭 LED...");
+                    device.power_off();
+                }
+                b'\r' | b'\n' => {  // 回车键
+                    println!("设置红色闪烁效果...");
+                    device.power_on();
+                    device.set_brightness(100);
+                    device.set_color(255, 0, 0);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    device.set_effect(device::EFFECTS.blink_red);
+                    device.set_effect_speed(50);
+                }
+                b'q' | b'Q' => {  // q 键退出
+                    println!("关闭 LED 并退出程序...");
+                    device.power_off();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
 }
